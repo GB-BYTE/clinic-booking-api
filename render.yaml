@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: clinic-booking-api
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: false
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: API_KEY
+        generateValue: true

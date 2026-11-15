@@ -1,0 +1,48 @@
+// Destructive contract test: use only your own assessment/test database.
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+const env=Object.fromEntries(fs.readFileSync(new URL('.env',import.meta.url),'utf8').trim().split(/\r?\n/).map(l=>{const i=l.indexOf('=');return [l.slice(0,i),l.slice(i+1)];}));
+const base=process.env.TEST_BASE_URL||'http://127.0.0.1:5078';
+const key=process.env.API_KEY||env.API_KEY;
+async function call(path,method='GET',body,headers={}){const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json','X-API-Key':key,...headers},body:body===undefined?undefined:JSON.stringify(body)});return {status:r.status,body:await r.json(),headers:r.headers};}
+const future=Date.now()+86400000;
+const slots=Array.from({length:12},(_,i)=>({id:'s'+i,provider:i%2?'Dr Ade':'Dr Obi',start:new Date(future+i*3600000).toISOString(),end:new Date(future+i*3600000+1800000).toISOString()}));
+slots.push({id:'past',provider:'Dr Ade',start:'2020-01-01T09:00:00Z',end:'2020-01-01T09:30:00Z'});
+const reset=async()=>assert.equal((await call('/reset','POST',{slots})).status,200);
+const book=(slot_id,email='ada@example.com',extra={})=>call('/bookings','POST',{slot_id,name:' Ada Obi ',email},extra);
+await reset();
+assert.equal((await call('/slots','GET',undefined,{'X-API-Key':''})).status,401);
+let listed=await call('/slots');assert.equal(listed.body.slots.length,13);assert.equal(listed.body.slots[0].id,'past');
+assert.ok((await call('/slots?provider=Dr%20Ade')).body.slots.every(s=>s.provider==='Dr Ade'));
+let booked=await book('s0',' ADA@EXAMPLE.COM ');assert.equal(booked.status,201);assert.equal(booked.body.email,'ada@example.com');assert.equal(booked.body.name,'Ada Obi');
+assert.deepEqual((await call('/bookings/'+booked.body.id)).body,booked.body);
+assert.equal((await call('/bookings/nope')).status,404);
+assert.equal((await call('/bookings','POST',{})).status,400);
+assert.equal((await book('s1','bad-email')).status,400);
+assert.equal((await book('missing','missing@example.com')).status,404);
+assert.equal((await book('past','past@example.com')).status,400);
+console.log('PASS levels 1–2: persistence, sorting, filters, authorization and validation');
+await reset();
+const racers=await Promise.all(Array.from({length:20},(_,i)=>book('s0',`race${i}@example.com`)));
+assert.equal(racers.filter(r=>r.status===201).length,1);assert.equal(racers.filter(r=>r.status===409).length,19);
+const winner=racers.find(r=>r.status===201).body;
+assert.equal((await call('/bookings/'+winner.id,'DELETE')).body.status,'cancelled');
+assert.equal((await call('/bookings/'+winner.id,'DELETE')).status,409);
+assert.equal((await book('s0','new@example.com')).status,201);
+console.log('PASS level 3: 20 concurrent requests produce one booking; cancellation frees slot');
+await reset();
+const retries=await Promise.all(Array.from({length:8},()=>book('s0','retry@example.com',{'Idempotency-Key':'same'})));
+assert.ok(retries.every(r=>r.status===201&&r.body.id===retries[0].body.id));
+assert.equal((await book('s1','retry@example.com',{'Idempotency-Key':'same'})).status,422);
+for(let i=1;i<4;i++)assert.equal((await book('s'+i,'page@example.com')).status,201);
+const first=await call('/bookings?email=PAGE%40EXAMPLE.COM&limit=2');assert.equal(first.body.bookings.length,2);assert.ok(first.body.next_cursor);
+const second=await call('/bookings?email=page%40example.com&limit=2&cursor='+encodeURIComponent(first.body.next_cursor));assert.equal(second.body.bookings.length,1);assert.equal(second.body.next_cursor,null);
+for(const limit of ['0','51','abc'])assert.equal((await call('/bookings?email=page@example.com&limit='+limit)).status,400);
+console.log('PASS level 4: concurrent retries, changed-body conflict and cursor pagination');
+await reset();
+for(let i=0;i<5;i++)assert.equal((await book('missing','rate@example.com')).status,404);
+const sixth=await book('s0',' RATE@EXAMPLE.COM ');assert.equal(sixth.status,429);assert.match(sixth.headers.get('Retry-After'),/^\d+$/);
+assert.equal((await book('s0','other@example.com')).status,201);
+console.log('PASS level 5: failed attempts counted, normalized email, Retry-After, isolated users');
+// Leave a clean set of future appointments for the demo.
+await reset();console.log('ALL TESTS PASSED. Demo slots restored.');
